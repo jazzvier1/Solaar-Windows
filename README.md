@@ -54,7 +54,7 @@ Tested on: **G733** and **G935** headsets, **G203** wired mouse.
 | Tray icon, start minimized | ✅ |
 | Wired Logitech G mice: DPI and lights | ✅ G203 (other models: feedback welcome) |
 | Blue VO!CE | ❌ |
-| Mice and keyboards on Unifying / Bolt / Lightspeed receivers | ❌ not yet |
+| Mice and keyboards on Unifying / Bolt / Lightspeed receivers | 🧪 experimental, untested on real hardware |
 | Rules and key remapping | ❌ Linux only |
 
 **Blue VO!CE** is not a headset setting: G HUB applies it to your microphone audio on the PC.

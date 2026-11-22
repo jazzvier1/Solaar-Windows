@@ -27,10 +27,14 @@ from __future__ import annotations
 
 import atexit
 import ctypes
+import itertools
 import logging
 import platform
+import queue
+import re
 import typing
 
+from threading import Event
 from threading import Thread
 from time import sleep
 from typing import Any
@@ -70,8 +74,26 @@ _library_paths = (
 # Windows rejects HID_GET_INPUT_REPORT on HID++ reports, so HID++ is recognized by collection usage instead:
 # FF43/0202 is the Logitech G headset collection, FF00/0002 the long-report collection of wired mice and keyboards.
 # shortcut: devices are driven with long reports only and short notifications (e.g. DPI button presses) are missed;
-# receivers need short reports, which Windows puts in another collection, so they are not supported yet
+# receivers need short reports too, which Windows puts in other collections of the same interface (see _ReceiverHandle)
 _WINDOWS_HIDPP_LONG_USAGES = {(0xFF43, 0x0202), (0xFF00, 0x0002)}
+# Windows splits the HID++ interface of a receiver into one collection per report ID: FF00/0001 carries the short
+# reports (0x10), FF00/0002 the long ones (0x11) and FF00/0004 the DJ ones (0x20). Their paths differ only in "&colNN".
+_WINDOWS_HIDPP_SHORT_USAGE = (0xFF00, 0x0001)
+_WINDOWS_RECEIVER_USAGES = {
+    0x10: (0xFF00, 0x0001),
+    0x11: (0xFF00, 0x0002),
+    0x20: (0xFF00, 0x0004),
+}
+# e.g. \\?\hid#vid_046d&pid_c52b&mi_02&col01#8&1a2b3c4d&0&0000#{guid}: the collection shows up as "&colNN" and as the
+# last field of the instance ID, so the collections of one interface share what comes before "&colNN" and the first two
+# fields of the instance ID
+_WINDOWS_COLLECTION_RE = re.compile(rb"^(.*?)&col[0-9a-f]+#([0-9a-z]+&[0-9a-z]+)&", re.IGNORECASE)
+
+
+def _collection_group(path: bytes):
+    match = _WINDOWS_COLLECTION_RE.match(path)
+    return match.groups() if match else None
+
 
 for lib in _library_paths:
     try:
@@ -179,8 +201,8 @@ class HIDError(Exception):
     pass
 
 
-def _enumerate_devices():
-    """Returns all HID devices which are potentially useful to us"""
+def _enumerate_collections():
+    """Returns every HID collection hidapi reports, each with its own path"""
     devices = []
     c_devices = _hidapi.hid_enumerate(0, 0)
     p = c_devices
@@ -188,6 +210,12 @@ def _enumerate_devices():
         devices.append(p.contents.as_dict())
         p = p.contents.next
     _hidapi.hid_free_enumeration(c_devices)
+    return devices
+
+
+def _enumerate_devices():
+    """Returns all HID devices which are potentially useful to us"""
+    devices = _enumerate_collections()
 
     unique_devices = {}
     for device in devices:
@@ -276,6 +304,7 @@ def _match(
         # FF00 is the generic vendor-defined page, so only trust it on Logitech devices
         usage = (device["usage_page"], device["usage"])
         device["hidpp_long"] = vid == LOGITECH_VENDOR_ID and usage in _WINDOWS_HIDPP_LONG_USAGES
+        device["hidpp_short"] = vid == LOGITECH_VENDOR_ID and usage == _WINDOWS_HIDPP_SHORT_USAGE
     else:
         try:
             device_handle = open_path(device["path"])
@@ -312,8 +341,14 @@ def _match(
     if not filtered_result:
         return
     is_device = filtered_result.get("isDevice")
-    if platform.system() == "Windows" and not is_device:
-        return None  # receivers: see _WINDOWS_HIDPP_LONG_USAGES
+    if platform.system() == "Windows":
+        if is_device and not device["hidpp_long"]:
+            return None  # a short-report collection alone cannot drive a device
+        if not is_device:
+            if not device["hidpp_short"]:
+                return None  # the other collections of a receiver are opened along with its short one
+            # the receiver is reported once, through its short collection, and opened as a group of collections
+            device["hidpp_long"] = True
 
     if action == ACTION_ADD:
         d_info = DeviceInfo(
@@ -405,6 +440,82 @@ def enumerate(filter_func) -> DeviceInfo:
             yield d_info
 
 
+class _ReceiverHandle:
+    """A receiver on Windows, which is one HID collection per report ID (short, long, DJ).
+
+    Writes go to the collection of the report's ID. Each collection is read by its own thread, because a blocking
+    read on one of them must not hold up the others, and the reports are merged into one queue in arrival order.
+    """
+
+    READ_SIZE = 64
+    POLL_MS = 100  # how often a reader thread looks for the stop request
+
+    def __init__(self, handles: dict[int, int]):
+        self.handles = handles  # report ID -> hidapi handle
+        self.reports: queue.Queue = queue.Queue()
+        self.stopping = Event()
+        self.threads = [Thread(target=self._pump, args=(handle,), daemon=True) for handle in handles.values()]
+        for thread in self.threads:
+            thread.start()
+
+    def _pump(self, handle):
+        while not self.stopping.is_set():
+            try:
+                data = _raw_read(handle, self.READ_SIZE, self.POLL_MS)
+            except HIDError as error:
+                self.reports.put(error)
+                return
+            if data:
+                self.reports.put(data)
+
+    def write(self, data: bytes) -> int:
+        handle = self.handles.get(data[0]) or self.handles.get(0x11)
+        if handle is None:
+            raise HIDError(f"receiver has no collection for report {data[0]:02X}")
+        return _raw_write(handle, data)
+
+    def read(self, timeout_ms):
+        try:
+            if timeout_ms is None or timeout_ms < 0:
+                report = self.reports.get()
+            elif timeout_ms == 0:
+                report = self.reports.get_nowait()
+            else:
+                report = self.reports.get(timeout=timeout_ms / 1000)
+        except queue.Empty:
+            return b""
+        if isinstance(report, HIDError):
+            self.reports.put(report)  # every later read fails too
+            raise report
+        return report
+
+    def close(self):
+        self.stopping.set()
+        for thread in self.threads:
+            thread.join(timeout=1)
+        for handle in self.handles.values():
+            _hidapi.hid_close(handle)
+        self.reports.put(HIDError("receiver closed"))  # releases a read that is waiting for a report
+
+
+_receiver_handles: dict[int, _ReceiverHandle] = {}
+_receiver_handle_ids = itertools.count(1 << 48)  # far from the pointers hidapi hands out
+
+
+def _receiver_collection_paths(device_path: bytes) -> dict[int, bytes] | None:
+    """The paths of the report collections that come with a receiver's short collection, by report ID."""
+    group = _collection_group(device_path)
+    if platform.system() != "Windows" or group is None:
+        return None
+    by_usage = {}
+    for device in _enumerate_collections():
+        if device["vendor_id"] == LOGITECH_VENDOR_ID and _collection_group(device["path"]) == group:
+            by_usage[(device["usage_page"], device["usage"])] = device["path"]
+    if by_usage.get(_WINDOWS_HIDPP_SHORT_USAGE) != device_path or (0xFF00, 0x0002) not in by_usage:
+        return None  # not the short collection of a receiver
+    return {report_id: by_usage[usage] for report_id, usage in _WINDOWS_RECEIVER_USAGES.items() if usage in by_usage}
+
+
 def open_path(device_path: str) -> int:
     """Open a HID device by its path name.
 
@@ -415,6 +526,24 @@ def open_path(device_path: str) -> int:
     if not isinstance(device_path, bytes):
         device_path = device_path.encode()
 
+    collections = _receiver_collection_paths(device_path)
+    if collections:
+        handles = {}
+        try:
+            for report_id, path in collections.items():
+                handles[report_id] = _open_raw(path)
+        except HIDError:
+            for handle in handles.values():
+                _hidapi.hid_close(handle)
+            raise
+        handle_id = next(_receiver_handle_ids)
+        _receiver_handles[handle_id] = _ReceiverHandle(handles)
+        return handle_id
+
+    return _open_raw(device_path)
+
+
+def _open_raw(device_path: bytes) -> int:
     device_handle = _hidapi.hid_open_path(device_path)
     if device_handle is None:
         raise HIDError(_hidapi.hid_error(None))
@@ -427,7 +556,11 @@ def close(device_handle) -> None:
     :param device_handle: a device handle returned by open() or open_path().
     """
     assert device_handle
-    _hidapi.hid_close(device_handle)
+    receiver = _receiver_handles.pop(device_handle, None)
+    if receiver:
+        receiver.close()
+    else:
+        _hidapi.hid_close(device_handle)
 
 
 def write(device_handle: int, data: bytes) -> int:
@@ -455,6 +588,13 @@ def write(device_handle: int, data: bytes) -> int:
     assert data
     assert isinstance(data, bytes), (repr(data), type(data))
 
+    receiver = _receiver_handles.get(device_handle)
+    if receiver:
+        return receiver.write(data)
+    return _raw_write(device_handle, data)
+
+
+def _raw_write(device_handle, data: bytes) -> int:
     bytes_written = _hidapi.hid_write(device_handle, data, len(data))
     if bytes_written < 0:
         raise HIDError(_hidapi.hid_error(device_handle))
@@ -479,6 +619,13 @@ def read(device_handle, bytes_count, timeout_ms=None):
     """
     assert device_handle
 
+    receiver = _receiver_handles.get(device_handle)
+    if receiver:
+        return receiver.read(timeout_ms)
+    return _raw_read(device_handle, bytes_count, timeout_ms)
+
+
+def _raw_read(device_handle, bytes_count, timeout_ms=None):
     data = ctypes.create_string_buffer(bytes_count)
     if timeout_ms is None or timeout_ms < 0:
         bytes_read = _hidapi.hid_read(device_handle, data, bytes_count)
