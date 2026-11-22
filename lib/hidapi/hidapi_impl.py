@@ -94,6 +94,7 @@ def _collection_group(path: bytes):
     match = _WINDOWS_COLLECTION_RE.match(path)
     return match.groups() if match else None
 
+
 for lib in _library_paths:
     try:
         _hidapi = ctypes.cdll.LoadLibrary(lib)
